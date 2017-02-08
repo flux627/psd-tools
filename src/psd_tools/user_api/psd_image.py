@@ -6,7 +6,7 @@ import collections
 import weakref              # FIXME: there should be weakrefs in this module
 import psd_tools.reader
 import psd_tools.decoder
-from psd_tools.constants import TaggedBlock, SectionDivider, BlendMode, TextProperty, PlacedLayerProperty, SzProperty
+from psd_tools.constants import TaggedBlock, SectionDivider, BlendMode, TextProperty, PlacedLayerProperty, SzProperty, ChannelID
 from psd_tools.user_api.layers import group_layers
 from psd_tools.user_api import pymaging_support
 from psd_tools.user_api import pil_support
@@ -51,6 +51,7 @@ class _RawLayer(object):
     _psd = None
     _index = None
 
+
     @property
     def name(self):
         """ Layer name (as unicode). """
@@ -58,6 +59,13 @@ class _RawLayer(object):
             TaggedBlock.UNICODE_LAYER_NAME,
             self._info.name
         )
+
+    @property
+    def has_mask(self):
+        return ChannelID.USER_LAYER_MASK in [ channel.id for channel in self._info.channels ]
+
+    def mask_as_PIL(self, crop_to=None):
+        return self._psd._user_layer_mask_as_PIL(self._index, crop_to)
 
     @property
     def visible(self):
@@ -286,6 +294,9 @@ class PSDImage(object):
 
     def _layer_as_PIL(self, index):
         return pil_support.extract_layer_image(self.decoded_data, index)
+
+    def _user_layer_mask_as_PIL(self, index, crop_to):
+        return pil_support.extract_user_layer_mask_image(self.decoded_data, index, crop_to)
 
     def _layer_as_pymaging(self, index):
         return pymaging_support.extract_layer_image(self.decoded_data, index)

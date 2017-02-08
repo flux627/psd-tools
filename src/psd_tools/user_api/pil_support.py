@@ -60,6 +60,43 @@ def extract_layer_image(decoded_data, layer_index):
     )
 
 
+def extract_user_layer_mask_image(decoded_data, layer_index, crop_to=None):
+    if crop_to != None and crop_to not in ["layer", "psd"]:
+        raise Exception("Unsupported crop_to value: %s" % crop_to)
+
+    layers = decoded_data.layer_and_mask_data.layers
+    layer = layers.layer_records[layer_index]
+    mask_data = layer.mask_data
+    channel_ids = _get_layer_channel_ids(layer)
+
+    if ChannelID.USER_LAYER_MASK in channel_ids:
+        channel_index = channel_ids.index(ChannelID.USER_LAYER_MASK)
+        mask_image = _get_single_band_image(
+            pil_band = "ULM",
+            channel = layers.channel_image_data[layer_index][channel_index],
+            channel_id  =ChannelID.USER_LAYER_MASK,
+            color_mode = decoded_data.header.color_mode,
+            size = (layer.width(), layer.height()),
+            origin = (layer.left, layer.top),
+            mask_size = (mask_data.width(), mask_data.height()) if mask_data else (0, 0),
+            mask_origin = (mask_data.left, mask_data.top) if mask_data else (0, 0),
+            mask_background_color = mask_data.background_color if mask_data else 0,
+            depth = decoded_data.header.depth,
+            crop_mask_to_layer = (crop_to == "layer")
+        )
+        if crop_to == "psd":
+            size = (decoded_data.header.width, decoded_data.header.height)
+            resized_image = Image.new('L', size, mask_data.background_color)
+            top_left = (mask_data.left, mask_data.top)
+            resized_image.paste(mask_image, top_left)
+            mask_image = resized_image
+
+        return mask_image
+    else:
+        raise Exception("Layer with name %s (index %d) does not have a USER_LAYER_MASK channel." % (
+                       layer.name, layer_index))
+
+
 def extract_composite_image(decoded_data):
     """
     Converts a composite (merged) image from the ``decoded_data``
@@ -81,10 +118,10 @@ def extract_composite_image(decoded_data):
         channel_ids=channel_ids,
         color_mode=header.color_mode,
         size=size,
-        # XXX
-        #origin = (layer.left, layer.top),
-        #mask_size = (mask_data.width(), mask_data.height()),
-        #mask_origin = (mask_data.left, mask_data.top),
+        origin = (0, 0),
+        mask_size = (0, 0),
+        mask_origin = (0, 0),
+        mask_background_color = 0,
         depth=header.depth,
         icc_profile=get_icc_profile(decoded_data)
     )
@@ -123,7 +160,8 @@ def apply_opacity(im, opacity):
         raise NotImplementedError()
 
 
-def _channel_data_to_PIL(channel_data, channel_ids, color_mode, size, origin, mask_size, mask_origin, mask_background_color, depth, icc_profile):
+def _channel_data_to_PIL(channel_data, channel_ids, color_mode, size, origin, mask_size, mask_origin,
+                        mask_background_color, depth, icc_profile):
     bands = _get_band_images(
         channel_data=channel_data,
         channel_ids=channel_ids,
@@ -182,51 +220,69 @@ def _merge_bands(bands, color_mode, size, icc_profile):
     return merged_image
 
 
-def _get_band_images(channel_data, channel_ids, color_mode, size, origin, mask_size, mask_origin, mask_background_color, depth):
+def _get_single_band_image(pil_band, channel, channel_id, color_mode, size, origin,mask_size, mask_origin,
+                          mask_background_color, depth, crop_mask_to_layer=True):
+    if pil_band is None:
+        warnings.warn("Unsupported channel type (%d)" % channel_id)
+        return
+
+    # Masks have their own size.
+    layer_size = mask_size if pil_band == 'ULM' else size
+
+    if channel.compression in [Compression.RAW, Compression.ZIP, Compression.ZIP_WITH_PREDICTION]:
+        if depth == 8:
+            im = _from_8bit_raw(channel.data, layer_size)
+        elif depth == 16:
+            im = _from_16bit_raw(channel.data, layer_size)
+        elif depth == 32:
+            im = _from_32bit_raw(channel.data, layer_size)
+        else:
+            warnings.warn("Unsupported depth (%s)" % depth)
+            return
+
+    elif channel.compression == Compression.PACK_BITS:
+        if depth != 8:
+            warnings.warn("Depth %s is unsupported for PackBits compression" % depth)
+            return
+        im = frombytes('L', layer_size, channel.data, "packbits", 'L')
+    else:
+        if Compression.is_known(channel.compression):
+            warnings.warn("Compression method is not implemented (%s)" % channel.compression)
+        else:
+            warnings.warn("Unknown compression method (%s)" % channel.compression)
+        return
+
+    image = im.convert('L')
+
+    # If this is a mask, convert it to the same size and origin as color channels.
+    if pil_band == 'ULM' and crop_mask_to_layer:
+        resized_image = Image.new('L', size, mask_background_color)
+        top_left = (mask_origin[0] - origin[0], mask_origin[1] - origin[1])
+        resized_image.paste(im, top_left)
+        image = resized_image
+
+    return image
+
+
+def _get_band_images(channel_data, channel_ids, color_mode, size, origin, mask_size, mask_origin,
+                    mask_background_color, depth):
     bands = {}
     for channel, channel_id in zip(channel_data, channel_ids):
-
         pil_band = _channel_id_to_PIL(channel_id, color_mode)
-        if pil_band is None:
-            warnings.warn("Unsupported channel type (%d)" % channel_id)
-            continue
-
-        # Masks have their own size.
-        layer_size = mask_size if pil_band == 'ULM' else size
-
-        if channel.compression in [Compression.RAW, Compression.ZIP, Compression.ZIP_WITH_PREDICTION]:
-            if depth == 8:
-                im = _from_8bit_raw(channel.data, layer_size)
-            elif depth == 16:
-                im = _from_16bit_raw(channel.data, layer_size)
-            elif depth == 32:
-                im = _from_32bit_raw(channel.data, layer_size)
-            else:
-                warnings.warn("Unsupported depth (%s)" % depth)
-                continue
-
-        elif channel.compression == Compression.PACK_BITS:
-            if depth != 8:
-                warnings.warn("Depth %s is unsupported for PackBits compression" % depth)
-                continue
-            im = frombytes('L', layer_size, channel.data, "packbits", 'L')
-        else:
-            if Compression.is_known(channel.compression):
-                warnings.warn("Compression method is not implemented (%s)" % channel.compression)
-            else:
-                warnings.warn("Unknown compression method (%s)" % channel.compression)
-            continue
-
-        image = im.convert('L')
-
-        # If this is a mask, convert it to the same size and origin as color channels.
-        if pil_band == 'ULM':
-            resized_image = Image.new('L', size, mask_background_color)
-            top_left = (mask_origin[0] - origin[0], mask_origin[1] - origin[1])
-            resized_image.paste(im, top_left)
-            image = resized_image
-
-        bands[pil_band] = image
+        image = _get_single_band_image(
+            pil_band=pil_band,
+            channel=channel,
+            channel_id=channel_id,
+            color_mode=color_mode,
+            size=size,
+            origin=origin,
+            mask_size=mask_size,
+            mask_origin=mask_origin,
+            mask_background_color=mask_background_color,
+            depth=depth
+        )
+        if image:
+            bands[pil_band] = image
     return bands
 
 
